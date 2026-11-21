@@ -72,6 +72,8 @@ harbor_agent:
 
       # Output root directory for Harbor job artifacts.
       harbor_jobs_dir: "/path/to/Gym/responses_api_agents/harbor_agent/jobs"
+      # Set true when harbor_jobs_dir is not shared by all Ray nodes: trial files then come back through Ray.
+      harbor_return_trial_files_via_ray: false
 
 harbor_agent_environment_server:
   environment_servers:

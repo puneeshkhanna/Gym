@@ -13,11 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import shutil
+import sys
 import tempfile
 from asyncio import Semaphore
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -29,6 +32,8 @@ from responses_api_agents.harbor_agent.app import (
     HarborAgent,
     HarborAgentConfig,
     HarborRunRequest,
+    _read_trial_file_bytes,
+    run_harbor_job,
 )
 from responses_api_agents.harbor_agent.utils import HarborAgentUtils
 
@@ -286,9 +291,14 @@ def _harbor_run_mocks(
 
         # The handler awaits the ray ObjectRef directly, so the mocked
         # future must be awaitable.
-        async def _resolve_future():
+        async def _resolve_future(params: Dict[str, Any]):
             if side_effect:
                 raise side_effect
+            if params.get("return_trial_files"):
+                # As the runner would: read on the node that ran the job, which the server cannot read.
+                files = _read_trial_file_bytes(Path(trial_dir))
+                shutil.rmtree(trial_dir)
+                return files
             return trial_dir
 
         if side_effect:
@@ -300,8 +310,8 @@ def _harbor_run_mocks(
                 agent_dir = Path(trial_dir) / "agent"
                 agent_dir.mkdir(parents=True, exist_ok=True)
                 (agent_dir / "trajectory.json").write_text(json.dumps(trajectory))
-        mock_ray.remote.side_effect = lambda *a, **k: _resolve_future()
-        mock_ray.options.return_value.remote.side_effect = lambda *a, **k: _resolve_future()
+        mock_ray.remote.side_effect = lambda *a, **k: _resolve_future(k.get("params", a[-1]))
+        mock_ray.options.return_value.remote.side_effect = lambda *a, **k: _resolve_future(k.get("params", a[-1]))
 
         # File parsing goes through asyncio.to_thread; run it inline.
         async def _run_inline(fn, *args, **kwargs):
@@ -378,6 +388,34 @@ class TestApp:
         assert response.response.id.startswith("resp_")
         assert len(response.responses_create_params.input) == 1
         assert "Fix the bug" in response.responses_create_params.input[0].content
+
+    async def test_run_uses_trial_files_returned_via_ray(self):
+        server = _make_server(harbor_return_trial_files_via_ray=True)
+        with _harbor_run_mocks(trajectory=DEFAULT_TRAJECTORY):
+            response = await server.run(_make_run_request())
+
+        # The mocked runner deleted the trial dir, so these came from the returned files.
+        assert response.reward == 1.0
+        assert len(response.response.output) == 6
+
+    async def test_run_harbor_job_returns_the_trial_files_when_asked(self, tmp_path: Path):
+        (tmp_path / "result.json").write_text('{"reward": 1}')
+        (tmp_path / "agent").mkdir()
+        (tmp_path / "agent" / "agent_error_flags.json").write_text('{"memory_limit_exceeded": true}')
+        job = MagicMock()
+        job.return_value.run = AsyncMock()
+        harbor_modules = {
+            "harbor.job": SimpleNamespace(Job=job),
+            "harbor.models.job.config": SimpleNamespace(JobConfig=MagicMock()),
+        }
+        with (
+            patch.dict(sys.modules, harbor_modules),
+            patch("responses_api_agents.harbor_agent.app._find_trial_dir_with_result", return_value=tmp_path),
+        ):
+            assert await run_harbor_job({}) == str(tmp_path.resolve())
+            files = await run_harbor_job({}, return_trial_files=True)
+
+        assert files == (b'{"reward": 1}', None, b'{"memory_limit_exceeded": true}')
 
     async def test_run_with_routed_experts_in_metrics_extra(self):
         routed_experts = [

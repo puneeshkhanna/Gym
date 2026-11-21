@@ -241,6 +241,9 @@ Each `/run` call writes to **two** places, for two different audiences:
   Harbor's own raw trial artifacts and the actual source of truth: per-trial
   `result.json` (reward, token counts, timing), `agent/trajectory.json` (full
   ATIF conversation), and `verifier/{reward.txt,reward.json,test-stdout.txt}`.
+  Harbor jobs run as Ray tasks on any node, and the agent server reads these files
+  by path, so on a multi-node cluster `harbor_jobs_dir` must be shared storage, or
+  set `harbor_return_trial_files_via_ray: true` to have them returned through Ray.
 
 When debugging a suspicious `results/runs/...` file, always cross-check the
 corresponding `harbor_jobs_dir/.../<trial_name>/result.json` and

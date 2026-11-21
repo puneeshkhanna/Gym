@@ -112,6 +112,9 @@ class HarborAgentConfig(BaseResponsesAPIAgentConfig):
     # --- Job output ---
     # Directory where Harbor writes job results and trial artifacts.
     harbor_jobs_dir: str = "jobs"
+    # Return each trial's result, trajectory and error flags through Ray instead of reading them by path. Set this
+    # when harbor_jobs_dir is not on storage shared by all Ray nodes: the job may run on another node.
+    harbor_return_trial_files_via_ray: bool = False
 
     # Keep Docker runtime images between trials (maps to EnvironmentConfig.delete=False).
     harbor_no_delete: bool = True
@@ -148,8 +151,13 @@ def _find_trial_dir_with_result(job_dir: Path) -> Optional[Path]:
     return None
 
 
-async def run_harbor_job(job_config_dict: dict) -> str:
-    """Runs a single Harbor Job and returns the *absolute* trial directory path.
+async def run_harbor_job(
+    job_config_dict: dict, *, return_trial_files: bool = False
+) -> str | tuple[bytes, bytes | None, bytes | None]:
+    """Runs a single Harbor Job and returns the *absolute* trial directory path, or its files' bytes.
+
+    With ``return_trial_files``, returns the trial files' bytes instead (see ``_read_trial_file_bytes``), read on
+    the node that ran the job.
 
     The trial directory contains:
     - result.json: Summary result with reward, agent_result, verifier_result, etc.
@@ -191,7 +199,8 @@ async def run_harbor_job(job_config_dict: dict) -> str:
     job_dir = config.jobs_dir / config.job_name
     trial_dir = _find_trial_dir_with_result(job_dir)
     if trial_dir is not None:
-        return str(trial_dir.resolve())
+        trial_dir = trial_dir.resolve()
+        return _read_trial_file_bytes(trial_dir) if return_trial_files else str(trial_dir)
 
     # No trial directory found — re-raise the original error if there was one,
     # otherwise raise FileNotFoundError.
@@ -200,10 +209,32 @@ async def run_harbor_job(job_config_dict: dict) -> str:
     raise FileNotFoundError(f"No trial result found in {job_dir.resolve()}")
 
 
+def _read_trial_file_bytes(trial_dir: Path) -> tuple[bytes, bytes | None, bytes | None]:
+    """Read a trial's result.json, agent/trajectory.json and agent/agent_error_flags.json (None if absent)."""
+    traj_path = trial_dir / "agent" / "trajectory.json"
+    flags_path = trial_dir / "agent" / "agent_error_flags.json"
+    return (
+        (trial_dir / "result.json").read_bytes(),
+        traj_path.read_bytes() if traj_path.exists() else None,
+        flags_path.read_bytes() if flags_path.exists() else None,
+    )
+
+
+def _parse_trial_files(
+    result: bytes, trajectory: bytes | None, agent_error_flags: bytes | None
+) -> tuple[dict, dict | None, dict]:
+    """Parse the files read by ``_read_trial_file_bytes``."""
+    return (
+        json.loads(result),
+        json.loads(trajectory) if trajectory is not None else None,
+        json.loads(agent_error_flags) if agent_error_flags is not None else {},
+    )
+
+
 _RAY_WORKER_EVENT_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
 
-def _run_harbor_job_sync(job_config_dict: dict) -> str:
+def _run_harbor_job_sync(job_config_dict: dict, *, return_trial_files: bool = False) -> str | tuple:
     """Synchronous wrapper for run_harbor_job for use in Ray remote.
 
     Ray workers are long-lived processes. Reusing a single event loop per worker
@@ -214,7 +245,9 @@ def _run_harbor_job_sync(job_config_dict: dict) -> str:
     if _RAY_WORKER_EVENT_LOOP is None or _RAY_WORKER_EVENT_LOOP.is_closed():
         _RAY_WORKER_EVENT_LOOP = asyncio.new_event_loop()
         asyncio.set_event_loop(_RAY_WORKER_EVENT_LOOP)
-    return _RAY_WORKER_EVENT_LOOP.run_until_complete(run_harbor_job(job_config_dict))
+    return _RAY_WORKER_EVENT_LOOP.run_until_complete(
+        run_harbor_job(job_config_dict, return_trial_files=return_trial_files)
+    )
 
 
 @ray.remote(
@@ -290,6 +323,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
             try:
                 params = dict(
                     job_config_dict=job_config_dict,
+                    return_trial_files=self.config.harbor_return_trial_files_via_ray,
                 )
                 runner = runner_ray_remote
                 if self.config.harbor_ray_task_num_cpus is not None:
@@ -298,20 +332,15 @@ class HarborAgent(SimpleResponsesAPIAgent):
                 # Await the ObjectRef directly; to_thread(ray.get, ...) would pin
                 # one executor thread per in-flight trial, so completed trials
                 # would queue behind long-running ones.
-                trial_dir_path = await future
-                trial_dir = Path(trial_dir_path)
+                job_output = await future
 
-                def _read_trial_files():
-                    traj_path = trial_dir / "agent" / "trajectory.json"
-                    flags_path = trial_dir / "agent" / "agent_error_flags.json"
-                    return (
-                        json.loads((trial_dir / "result.json").read_text()),
-                        json.loads(traj_path.read_text()) if traj_path.exists() else None,
-                        json.loads(flags_path.read_text()) if flags_path.exists() else {},
-                    )
+                def _trial_files():
+                    if self.config.harbor_return_trial_files_via_ray:
+                        return _parse_trial_files(*job_output)
+                    return _parse_trial_files(*_read_trial_file_bytes(Path(job_output)))
 
                 # Trajectories can be many MB; parse off the event loop.
-                trial_result, trajectory, agent_error_flags = await asyncio.to_thread(_read_trial_files)
+                trial_result, trajectory, agent_error_flags = await asyncio.to_thread(_trial_files)
 
                 # Extract reward from verifier result
                 verifier_result = trial_result.get("verifier_result")
